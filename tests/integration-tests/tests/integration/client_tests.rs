@@ -26,10 +26,6 @@ use hickory_net::xfer::{DnsHandle, DnsMultiplexer};
 #[cfg(feature = "__dnssec")]
 use hickory_proto::dnssec::TrustAnchors;
 #[cfg(all(feature = "__dnssec", feature = "sqlite"))]
-use hickory_proto::dnssec::rdata::{DNSSECRData, KEY};
-#[cfg(all(feature = "__dnssec", feature = "sqlite"))]
-use hickory_proto::dnssec::{Algorithm, PublicKey, SigSigner, SigningKey, crypto::RsaSigningKey};
-#[cfg(all(feature = "__dnssec", feature = "sqlite"))]
 use hickory_proto::op::MessageSigner;
 #[cfg(feature = "__dnssec")]
 use hickory_proto::op::ResponseCode;
@@ -404,9 +400,9 @@ async fn test_nsec3_nxdomain() {
 #[allow(deprecated)]
 #[cfg(all(feature = "__dnssec", feature = "sqlite"))]
 async fn create_sig0_ready_client(mut catalog: Catalog) -> (Client<TokioRuntimeProvider>, Name) {
-    use hickory_proto::dnssec::rdata::key::{KeyTrust, KeyUsage, Protocol, UpdateScope};
+    use hickory_proto::dnssec::TSigner;
+    use hickory_proto::dnssec::rdata::tsig::TsigAlgorithm;
     use hickory_server::store::sqlite::SqliteZoneHandler;
-    use rustls_pki_types::PrivatePkcs8KeyDer;
 
     let handler = create_example();
     let mut handler =
@@ -414,38 +410,22 @@ async fn create_sig0_ready_client(mut catalog: Catalog) -> (Client<TokioRuntimeP
     handler.set_allow_update(true);
     let origin = handler.origin().clone();
 
-    const KEY: &[u8] = include_bytes!("../rsa-2048.pk8");
-    let key =
-        RsaSigningKey::from_pkcs8(&PrivatePkcs8KeyDer::from(KEY), Algorithm::RSASHA256).unwrap();
-    let pub_key = key.to_public_key().unwrap();
-
-    let signer = SigSigner::new(
-        Box::new(key),
-        Name::from_str("trusted.example.com.").unwrap(),
-        // can be Duration::MAX after min Rust version 1.53
-        std::time::Duration::new(u64::MAX, 1_000_000_000 - 1),
-        true,
-        true,
+    let secret_key = b"test_secret_key_for_client_tests".to_vec();
+    let signer = Arc::new(
+        TSigner::new(
+            secret_key,
+            TsigAlgorithm::HmacSha256,
+            Name::from_str("trusted.example.com.").unwrap(),
+            300,
+        )
+        .unwrap(),
     );
 
-    // insert the KEY for the trusted.example.com
-    let auth_key = Record::from_rdata(
-        Name::from_str("trusted.example.com.").unwrap(),
-        Duration::minutes(5).whole_seconds() as u32,
-        RData::DNSSEC(DNSSECRData::KEY(KEY::new(
-            KeyTrust::default(),
-            KeyUsage::default(),
-            UpdateScope::default(),
-            Protocol::default(),
-            signer.key().algorithm(),
-            pub_key.public_bytes().to_vec(),
-        ))),
-    );
-    handler.upsert_mut(auth_key, 0);
+    handler.set_tsig_signers(vec![(*signer).clone()]);
 
     catalog.upsert(handler.origin().clone(), vec![Arc::new(handler)]);
     let multiplexer = TestClientConnection::new(catalog)
-        .to_multiplexer(Some(Arc::new(signer)))
+        .to_multiplexer(Some(signer))
         .await;
     let (client, driver) = Client::from_sender(multiplexer);
     tokio::spawn(driver);
